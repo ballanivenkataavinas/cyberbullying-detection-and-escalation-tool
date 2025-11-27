@@ -1,0 +1,211 @@
+import json
+import re
+import sqlite3
+from collections import Counter
+from datetime import datetime, timedelta
+
+class AdvancedToxicDetector:
+    def __init__(self):
+        self.root = {}
+        self.language_counters = Counter()
+        self._load_extended_keywords()
+        self.conn = sqlite3.connect('cyberbully.db')
+        self._init_db()
+
+    def _init_db(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS offenses (
+                user_id TEXT PRIMARY KEY,
+                count INTEGER,
+                last_offense TIMESTAMP,
+                severity_score INTEGER,
+                lockout_until TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cases (
+                case_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                text TEXT,
+                severity INTEGER,
+                timestamp TIMESTAMP,
+                status TEXT
+            )
+        ''')
+        self.conn.commit()
+
+    def _load_extended_keywords(self):
+        keywords = [
+            ("stupid", "english", 1), ("idiot", "english", 1), ("moron", "english", 1), ("dumb", "english", 1),
+            ("ugly", "english", 2), ("fat", "english", 2), ("disgusting", "english", 2), ("gross", "english", 2),
+            ("kill yourself", "english", 3), ("die", "english", 3), ("worthless", "english", 2),
+            ("loser", "english", 1), ("trash", "english", 1), ("nobody likes you", "english", 3),
+            ("you're nothing", "english", 3), ("pathetic", "english", 2), ("hate you", "english", 3),
+            ("unwanted", "english", 2), ("failure", "english", 1), ("retard", "english", 3),
+            ("freak", "english", 2), ("go to hell", "english", 3), ("no one cares", "english", 2),
+            ("drop dead", "english", 3), ("shut up", "english", 1), ("disgrace", "english", 2),
+            ("vermin", "english", 2), ("scum", "english", 2), ("snake", "english", 1),
+            ("creep", "english", 1), ("jerk", "english", 1), ("die in a hole", "english", 3),
+            ("drown", "english", 3), ("backstabber", "english", 1),
+            ("estúpido", "spanish", 1), ("feo", "spanish", 2), ("mátate", "spanish", 3),
+            ("muere", "spanish", 3), ("asqueroso", "spanish", 2), ("nadie te quiere", "spanish", 3),
+            ("stupide", "french", 1), ("laid", "french", 2), ("meurs", "french", 3),
+            ("personne ne t'aime", "french", 3), ("dégoûtant", "french", 2), ("crétin", "french", 1)
+        ]
+        for word, language, severity in keywords:
+            self._add_to_trie(word, language, severity)
+
+    def _add_to_trie(self, word, language, severity):
+        node = self.root
+        for char in word:
+            if char not in node:
+                node[char] = {}
+            node = node[char]
+        node['#'] = (language, severity)
+
+    def _search_trie(self, text):
+        results = []
+        i = 0
+        while i < len(text):
+            node = self.root
+            j = i
+            matched = []
+            while j < len(text) and text[j] in node:
+                matched.append(text[j])
+                node = node[text[j]]
+                j += 1
+                if '#' in node:
+                    language, severity = node['#']
+                    self.language_counters[language] += 1
+                    results.append((''.join(matched), language, severity))
+            if not matched:
+                i += 1
+            else:
+                i = j
+        return results
+
+class CyberbullyingSystem:
+    def __init__(self):
+        self.detector = AdvancedToxicDetector()
+        self._load_config()
+
+    def _load_config(self):
+        try:
+            with open('config.json') as f:
+                self.config = json.load(f)
+        except:
+            self.config = {
+                "severity_thresholds": {"mild": 1, "moderate": 3, "severe": 5},
+                "response_actions": {"mild": "warning", "moderate": "temporary_suspension", "severe": "permanent_ban"}
+            }
+
+    def analyze_message(self, text, user_id):
+        if self._is_lockout(user_id):
+            print(f"⚠️ User {user_id} is currently LOCKED OUT due to a permanent ban. No analysis done.")
+            return {"risk_level": "locked_out", "score": 0, "action": "locked", "matched_terms": []}
+
+        matches = self.detector._search_trie(text.lower())
+        base_score = sum(sev for _, _, sev in matches)
+        context_score = self._analyze_context(text)
+        hour_now = datetime.now().hour
+
+        thresholds = {"mild": 1, "moderate": 2, "severe": 4} if 0 <= hour_now <= 5 else self.config["severity_thresholds"]
+        if 0 <= hour_now <= 5:
+            base_score += 1
+
+        user_score, rapid_escalation = self._check_user_history(user_id)
+        if rapid_escalation:
+            base_score += 2
+
+        total_score = base_score + context_score + user_score
+        forgiveness_allowed = not self._is_lockout(user_id)
+
+        action, risk_level = self._determine_action(total_score, thresholds)
+        self._create_case(user_id, text, total_score, action)
+        self._update_user_profile(user_id, total_score, forgiveness_allowed, action)
+
+        return {"risk_level": risk_level, "score": total_score, "action": action,
+                "matched_terms": [(term, lang) for term, lang, _ in matches]}
+
+    def _analyze_context(self, text):
+        score = 0
+        if text.isupper():
+            score += 2
+        if any(c in text for c in "!?¿¡"):
+            score += 1
+        if len(re.findall(r'\b\w{15,}\b', text)) > 3:
+            score += 1
+        return score
+
+    def _check_user_history(self, user_id):
+        cursor = self.detector.conn.cursor()
+        cursor.execute('SELECT count, last_offense FROM offenses WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        if result:
+            count, last_offense = result
+            if last_offense:
+                last_time = datetime.strptime(last_offense, '%Y-%m-%d %H:%M:%S')
+                if (datetime.now() - last_time).total_seconds() < 600:
+                    return min(count * 2, 5), True
+            return min(count, 5), False
+        return 0, False
+
+    def _is_lockout(self, user_id):
+        cursor = self.detector.conn.cursor()
+        cursor.execute('SELECT lockout_until FROM offenses WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        if result and result[0]:
+            lock_time = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
+            return datetime.now() < lock_time
+        return False
+
+    def _determine_action(self, score, thresholds):
+        if score >= thresholds["severe"]:
+            return self.config["response_actions"]["severe"], "severe"  
+        elif score >= thresholds["moderate"]:
+            return self.config["response_actions"]["moderate"], "moderate"
+        elif score >= thresholds["mild"]:
+            return self.config["response_actions"]["mild"], "mild"
+        return "no_action", "clean"
+
+    def _create_case(self, user_id, text, score, action):
+        cursor = self.detector.conn.cursor()
+        cursor.execute('INSERT INTO cases (user_id, text, severity, timestamp, status) VALUES (?, ?, ?, ?, ?)',
+                       (user_id, text, score, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), action))
+        self.detector.conn.commit()
+
+    def _update_user_profile(self, user_id, score, forgiveness_allowed, action):
+        cursor = self.detector.conn.cursor()
+        lockout_until = (datetime.now() + timedelta(hours=48)).strftime('%Y-%m-%d %H:%M:%S') if action == "permanent_ban" else None
+        if forgiveness_allowed:
+            cursor.execute('''
+                INSERT OR REPLACE INTO offenses (user_id, count, last_offense, severity_score, lockout_until)
+                VALUES (?, COALESCE((SELECT count+1 FROM offenses WHERE user_id = ?), 1),
+                ?, COALESCE((SELECT severity_score + ? FROM offenses WHERE user_id = ?), ?), ?)
+            ''', (user_id, user_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), score, user_id, score, lockout_until))
+        else:
+            cursor.execute('''
+                INSERT OR REPLACE INTO offenses (user_id, count, last_offense, severity_score, lockout_until)
+                VALUES (?, COALESCE((SELECT count FROM offenses WHERE user_id = ?), 1),
+                ?, COALESCE((SELECT severity_score + ? FROM offenses WHERE user_id = ?), ?), ?)
+            ''', (user_id, user_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), score, user_id, score, lockout_until))
+        self.detector.conn.commit()
+
+if __name__ == "__main__":
+    system = CyberbullyingSystem()
+    while True:
+        text = input("\nEnter a message (or type 'exit'): ")
+        if text.lower() == "exit":
+            break
+        user_id = input("Enter user id: ")
+        result = system.analyze_message(text, user_id)
+        print("\n=== Analysis Result ===")
+        print(f"Risk Level: {result['risk_level']}")
+        print(f"Score: {result['score']}")
+        tags = ', '.join([f"{term} ({lang})" for term, lang in result['matched_terms']])
+        print(f"Matched Terms: {tags if tags else 'None'}")
+        print("Language-based analytics:")
+        print(f"English toxicity detected: {system.detector.language_counters.get('english',0)}")
+        print(f"Spanish: {system.detector.language_counters.get('spanish',0)}")
+        print(f"French: {system.detector.language_counters.get('french',0)}")
